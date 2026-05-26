@@ -1,0 +1,14 @@
+[package]
+name = "hermes-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "hermes"
+path = "src/main.rs"
+
+[dependencies]
+hermes-proxy = {path = "../hermes-proxy"}
+hermes-scripts = {path = "../hermes-scripts"}
+hermes-store = {path = "../hermes-store"}
+hermes-tui = {path = "../hermes-tui"}
