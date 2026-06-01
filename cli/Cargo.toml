@@ -1,0 +1,15 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "hermes"
+path = "src/main.rs"
+
+[dependencies]
+proxy = {path = "../proxy"}
+scripts = {path = "../scripts"}
+store = {path = "../store"}
+tui = {path = "../tui"}
+tokio = { version = "1", features = ["full"] }
