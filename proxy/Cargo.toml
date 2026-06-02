@@ -5,3 +5,8 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+rustls = "0.23"
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+rustls-pemfile = "2"
