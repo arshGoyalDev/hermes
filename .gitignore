@@ -2,3 +2,5 @@
 
 *.md
 !README.md
+hermes-ca.crt
+hermes-ca.key
