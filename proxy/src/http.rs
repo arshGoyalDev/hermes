@@ -14,6 +14,7 @@ pub struct RequestHead {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ResponseHead {
   pub start_line: String,
   pub status_code: u16,

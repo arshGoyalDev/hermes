@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+store = { path = "../store" }
 tokio = { version = "1", features = ["full"] }
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rustls = "0.23"

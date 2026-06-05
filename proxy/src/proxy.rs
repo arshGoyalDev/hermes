@@ -10,9 +10,13 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
+use store::{RequestData, ResponseData, Transaction};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+use tokio::time::{Duration, timeout};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
@@ -23,6 +27,8 @@ use webpki_roots::TLS_SERVER_ROOTS;
 const CAPTURE_LIMIT: usize = 16 * 1024;
 const CA_CERT_PATH: &str = "hermes-ca.crt";
 const CA_KEY_PATH: &str = "hermes-ca.key";
+/// How long to wait for a TCP connection to the upstream before giving up.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -37,10 +43,68 @@ impl Default for ProxyConfig {
   }
 }
 
-pub async fn run(config: ProxyConfig) -> io::Result<()> {
+/// Shared proxy state, cloned into each spawned task.
+struct ProxyState {
+  ca_cert: rcgen::Certificate,
+  ca_key: rcgen::KeyPair,
+  tls_connector: TlsConnector,
+  cert_cache: Mutex<std::collections::HashMap<String, Arc<ServerConfig>>>,
+  /// Sender half of the channel that feeds captured transactions to the TUI.
+  tx_sink: mpsc::UnboundedSender<Transaction>,
+}
+
+impl ProxyState {
+  fn new(
+    ca_cert: rcgen::Certificate,
+    ca_key: rcgen::KeyPair,
+    tx_sink: mpsc::UnboundedSender<Transaction>,
+  ) -> io::Result<Self> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(TLS_SERVER_ROOTS.iter().cloned());
+
+    let client_config = ClientConfig::builder()
+      .with_root_certificates(roots)
+      .with_no_client_auth();
+    let tls_connector = TlsConnector::from(Arc::new(client_config));
+
+    Ok(Self {
+      ca_cert,
+      ca_key,
+      tls_connector,
+      cert_cache: Mutex::new(std::collections::HashMap::new()),
+      tx_sink,
+    })
+  }
+
+  fn tls_acceptor_for_host(&self, host: &str) -> io::Result<TlsAcceptor> {
+    let mut cache = self
+      .cert_cache
+      .lock()
+      .map_err(|_| io::Error::new(io::ErrorKind::Other, "cert cache poisoned"))?;
+    if let Some(config) = cache.get(host) {
+      return Ok(TlsAcceptor::from(Arc::clone(config)));
+    }
+
+    let config = Arc::new(make_server_config(&self.ca_cert, &self.ca_key, host)?);
+    cache.insert(host.to_string(), Arc::clone(&config));
+    Ok(TlsAcceptor::from(config))
+  }
+
+  /// Send a finished `Transaction` to the TUI (fire-and-forget).
+  fn emit(&self, tx: Transaction) {
+    // Ignore send errors — the TUI may have exited before the proxy.
+    let _ = self.tx_sink.send(tx);
+  }
+}
+
+/// Run the proxy, forwarding every captured transaction to `tx_sink`.
+pub async fn run(
+  config: ProxyConfig,
+  tx_sink: mpsc::UnboundedSender<Transaction>,
+) -> io::Result<()> {
   let (ca_cert, ca_key) = load_or_create_ca()?;
   print_install_instructions(CA_CERT_PATH);
-  let state = Arc::new(ProxyState::new(ca_cert, ca_key)?);
+  let state = Arc::new(ProxyState::new(ca_cert, ca_key, tx_sink)?);
   let listener = TcpListener::bind(config.bind_addr).await?;
   eprintln!("Hermes proxy listening on {}", config.bind_addr);
 
@@ -66,7 +130,7 @@ async fn handle_client(stream: TcpStream, state: &Arc<ProxyState>) -> io::Result
     return handle_connect(reader, request.target, state).await;
   }
 
-  handle_http(reader, request).await
+  handle_http(reader, request, state).await
 }
 
 async fn handle_connect(
@@ -75,13 +139,11 @@ async fn handle_connect(
   state: &Arc<ProxyState>,
 ) -> io::Result<()> {
   let (host, port) = split_host_port(&target, 443)?;
-  eprintln!(">> CONNECT {}:{}", host, port);
 
   let mut reader = reader;
   let buffered = reader.buffer().to_vec();
   reader.consume(buffered.len());
   let mut client = reader.into_inner();
-  eprintln!("<< 200 Connection Established");
   client
     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
     .await?;
@@ -96,7 +158,6 @@ async fn handle_connect_mitm(
   port: u16,
   state: &Arc<ProxyState>,
 ) -> io::Result<()> {
-  eprintln!("-- MITM handshake for {}:{}", host, port);
   let client = PrefixedStream::new(client, buffered);
   let acceptor = state.tls_acceptor_for_host(&host)?;
   let client_tls = acceptor.accept(client).await?;
@@ -106,7 +167,14 @@ async fn handle_connect_mitm(
     Err(_) => ServerName::try_from(host.clone())
       .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid server name"))?,
   };
-  let upstream = TcpStream::connect((host.as_str(), port)).await?;
+  let upstream = timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port)))
+    .await
+    .map_err(|_| {
+      io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("connect to {}:{} timed out", host, port),
+      )
+    })??;
   let mut upstream_tls = state.tls_connector.connect(server_name, upstream).await?;
 
   let mut client_reader = BufReader::new(client_tls);
@@ -117,6 +185,11 @@ async fn handle_connect_mitm(
 
   let (upstream_host, upstream_port, forward_target, mut headers) = resolve_upstream(&request)?;
   remove_header(&mut headers, "proxy-connection");
+
+  // Force connection close so the upstream commits to one request per tunnel.
+  // This prevents curl from reusing the CONNECT tunnel and hitting broken-pipe
+  // errors (which cause multi-second retry delays).
+  force_close(&mut headers);
   if !has_header(&headers, "host") {
     let host_value = if upstream_port == 443 {
       upstream_host.clone()
@@ -126,12 +199,14 @@ async fn handle_connect_mitm(
     headers.push(("Host".to_string(), host_value));
   }
 
+  let url = format!("https://{}{}", upstream_host, forward_target);
   let start_line = format!("{} {} {}", request.method, forward_target, request.version);
   let head_bytes = build_head(&start_line, &headers);
   upstream_tls.write_all(&head_bytes).await?;
-  log_head("request", &start_line, &headers);
 
   let mut request_capture = Vec::new();
+  let start = Instant::now();
+
   match body_kind(&headers) {
     BodyKind::None => {}
     BodyKind::ContentLength(len) => {
@@ -155,12 +230,20 @@ async fn handle_connect_mitm(
     }
   }
 
-  log_body("request body", &request_capture);
+  // Build the Transaction (no response yet).
+  let mut transaction = Transaction::new(RequestData {
+    method: request.method.clone(),
+    url,
+    headers: headers.clone(),
+    body: request_capture,
+  });
 
   let mut upstream_reader = BufReader::new(&mut upstream_tls);
   let response = read_response_head(&mut upstream_reader).await?;
-  log_response_head(&response.start_line, &response.headers);
-  client_reader.get_mut().write_all(&response.raw).await?;
+  // Rewrite the response head so the client sees Connection: close and won't
+  // try to pipeline another request on this already-dying tunnel.
+  let rewritten_head = rewrite_response_head_close(&response.start_line, &response.headers);
+  client_reader.get_mut().write_all(&rewritten_head).await?;
 
   let mut response_capture = Vec::new();
   match response_body_kind(response.status_code, &response.headers) {
@@ -186,18 +269,35 @@ async fn handle_connect_mitm(
     }
   }
 
-  log_body("response body", &response_capture);
-  client_reader.get_mut().shutdown().await?;
+  let duration_ms = start.elapsed().as_millis() as u64;
+  transaction.response = Some(ResponseData {
+    status: response.status_code,
+    headers: response.headers,
+    body: response_capture,
+  });
+  transaction.duration_ms = Some(duration_ms);
+
+  state.emit(transaction);
+
+  // BrokenPipe here means the client already closed its side after reading the
+  // response — that's expected and harmless, so we swallow it.
+  if let Err(e) = client_reader.get_mut().shutdown().await {
+    if e.kind() != io::ErrorKind::BrokenPipe {
+      return Err(e);
+    }
+  }
   Ok(())
 }
 
 async fn handle_http(
   mut reader: BufReader<TcpStream>,
   request: crate::http::RequestHead,
+  state: &Arc<ProxyState>,
 ) -> io::Result<()> {
   let (upstream_host, upstream_port, forward_target, mut headers) = resolve_upstream(&request)?;
 
   remove_header(&mut headers, "proxy-connection");
+  force_close(&mut headers);
   if !has_header(&headers, "host") {
     let host_value = if upstream_port == 80 {
       upstream_host.clone()
@@ -207,14 +307,26 @@ async fn handle_http(
     headers.push(("Host".to_string(), host_value));
   }
 
+  let url = format!("http://{}{}", upstream_host, forward_target);
   let start_line = format!("{} {} {}", request.method, forward_target, request.version);
   let head_bytes = build_head(&start_line, &headers);
 
-  let mut upstream = TcpStream::connect((upstream_host.as_str(), upstream_port)).await?;
+  let mut upstream = timeout(
+    CONNECT_TIMEOUT,
+    TcpStream::connect((upstream_host.as_str(), upstream_port)),
+  )
+  .await
+  .map_err(|_| {
+    io::Error::new(
+      io::ErrorKind::TimedOut,
+      format!("connect to {}:{} timed out", upstream_host, upstream_port),
+    )
+  })??;
   upstream.write_all(&head_bytes).await?;
-  log_head("request", &start_line, &headers);
 
   let mut request_capture = Vec::new();
+  let start = Instant::now();
+
   match body_kind(&headers) {
     BodyKind::None => {}
     BodyKind::ContentLength(len) => {
@@ -238,13 +350,18 @@ async fn handle_http(
     }
   }
 
-  log_body("request body", &request_capture);
+  let mut transaction = Transaction::new(RequestData {
+    method: request.method.clone(),
+    url,
+    headers: headers.clone(),
+    body: request_capture,
+  });
 
   let mut upstream_reader = BufReader::new(upstream);
   let response = read_response_head(&mut upstream_reader).await?;
-  log_response_head(&response.start_line, &response.headers);
   let client = reader.get_mut();
-  client.write_all(&response.raw).await?;
+  let rewritten_head = rewrite_response_head_close(&response.start_line, &response.headers);
+  client.write_all(&rewritten_head).await?;
 
   let mut response_capture = Vec::new();
   match response_body_kind(response.status_code, &response.headers) {
@@ -270,8 +387,23 @@ async fn handle_http(
     }
   }
 
-  log_body("response body", &response_capture);
-  client.shutdown().await?;
+  let duration_ms = start.elapsed().as_millis() as u64;
+  transaction.response = Some(ResponseData {
+    status: response.status_code,
+    headers: response.headers,
+    body: response_capture,
+  });
+  transaction.duration_ms = Some(duration_ms);
+
+  state.emit(transaction);
+
+  // BrokenPipe here means the client already closed its side after reading the
+  // response — that's expected and harmless, so we swallow it.
+  if let Err(e) = client.shutdown().await {
+    if e.kind() != io::ErrorKind::BrokenPipe {
+      return Err(e);
+    }
+  }
   Ok(())
 }
 
@@ -290,69 +422,28 @@ fn resolve_upstream(
   Ok((host, port, request.target.clone(), headers))
 }
 
-fn log_head(kind: &str, start_line: &str, headers: &[(String, String)]) {
-  println!("{}: {}", kind, start_line);
-  for (name, value) in headers {
-    println!("{}: {}: {}", kind, name, value);
-  }
-  println!("{}:", kind);
+/// Replace (or insert) `Connection: close` in a set of request headers.
+///
+/// This tells the upstream server to close the connection after one response,
+/// which avoids the broken-pipe / retry latency caused by curl trying to
+/// pipeline a second request on an already-dying CONNECT tunnel.
+fn force_close(headers: &mut Vec<(String, String)>) {
+  remove_header(headers, "connection");
+  remove_header(headers, "keep-alive");
+  headers.push(("Connection".to_string(), "close".to_string()));
 }
 
-fn log_response_head(start_line: &str, headers: &[(String, String)]) {
-  println!("response: {}", start_line);
-  for (name, value) in headers {
-    println!("response: {}: {}", name, value);
-  }
-  println!("response:");
-}
-
-fn log_body(label: &str, body: &[u8]) {
-  if body.is_empty() {
-    return;
-  }
-  let display = String::from_utf8_lossy(body);
-  println!("{} ({} bytes):", label, body.len());
-  println!("{}", display);
-}
-
-struct ProxyState {
-  ca_cert: rcgen::Certificate,
-  ca_key: rcgen::KeyPair,
-  tls_connector: TlsConnector,
-  cert_cache: Mutex<std::collections::HashMap<String, Arc<ServerConfig>>>,
-}
-
-impl ProxyState {
-  fn new(ca_cert: rcgen::Certificate, ca_key: rcgen::KeyPair) -> io::Result<Self> {
-    let mut roots = RootCertStore::empty();
-    roots.extend(TLS_SERVER_ROOTS.iter().cloned());
-
-    let client_config = ClientConfig::builder()
-      .with_root_certificates(roots)
-      .with_no_client_auth();
-    let tls_connector = TlsConnector::from(Arc::new(client_config));
-
-    Ok(Self {
-      ca_cert,
-      ca_key,
-      tls_connector,
-      cert_cache: Mutex::new(std::collections::HashMap::new()),
-    })
-  }
-
-  fn tls_acceptor_for_host(&self, host: &str) -> io::Result<TlsAcceptor> {
-    let mut cache = self
-      .cert_cache
-      .lock()
-      .map_err(|_| io::Error::new(io::ErrorKind::Other, "cert cache poisoned"))?;
-    if let Some(config) = cache.get(host) {
-      return Ok(TlsAcceptor::from(Arc::clone(config)));
-    }
-
-    let config = Arc::new(make_server_config(&self.ca_cert, &self.ca_key, host)?);
-    cache.insert(host.to_string(), Arc::clone(&config));
-    Ok(TlsAcceptor::from(config))
-  }
+/// Build a fresh response head that is identical to the upstream's, except
+/// `Connection` is overridden to `close`.  This prevents the client (curl,
+/// browser, …) from believing the tunnel is reusable.
+fn rewrite_response_head_close(start_line: &str, headers: &[(String, String)]) -> Vec<u8> {
+  let mut new_headers: Vec<(String, String)> = headers
+    .iter()
+    .filter(|(n, _)| !n.eq_ignore_ascii_case("connection") && !n.eq_ignore_ascii_case("keep-alive"))
+    .cloned()
+    .collect();
+  new_headers.push(("Connection".to_string(), "close".to_string()));
+  build_head(start_line, &new_headers)
 }
 
 fn load_or_create_ca() -> io::Result<(rcgen::Certificate, rcgen::KeyPair)> {
@@ -415,11 +506,11 @@ fn make_server_config(
 }
 
 fn print_install_instructions(cert_path: &str) {
-  eprintln!("\nHermes root CA created at {}", cert_path);
+  eprintln!("\nHermes root CA: {}", cert_path);
   eprintln!("Install into your trust store to intercept HTTPS:");
-  eprintln!("  Linux (NSS db used by Firefox/Chrome):");
+  eprintln!("  Linux (NSS):");
   eprintln!(
-    "    certutil -d sql:$HOME/.pki/nssdb -A -t \\\"CT,C,C\\\" -n \\\"Hermes Proxy CA\\\" -i {}",
+    "    certutil -d sql:$HOME/.pki/nssdb -A -t \"CT,C,C\" -n \"Hermes Proxy CA\" -i {}",
     cert_path
   );
   eprintln!("  macOS:");
@@ -427,12 +518,14 @@ fn print_install_instructions(cert_path: &str) {
     "    sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain {}",
     cert_path
   );
-  eprintln!("\nThen run:");
+  eprintln!("\nTest with:");
   eprintln!(
     "  curl -x http://localhost:8080 --cacert {} https://httpbin.org/get",
     cert_path
   );
 }
+
+// ── PrefixedStream — replays buffered bytes before reading the inner stream ──
 
 struct PrefixedStream<S> {
   inner: S,
