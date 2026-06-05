@@ -8,8 +8,9 @@ name = "hermes"
 path = "src/main.rs"
 
 [dependencies]
-proxy = {path = "../proxy"}
-scripts = {path = "../scripts"}
-store = {path = "../store"}
-tui = {path = "../tui"}
+proxy = { path = "../proxy" }
+store = { path = "../store" }
+tui = { path = "../tui" }
+scripts = { path = "../scripts" }
 tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
