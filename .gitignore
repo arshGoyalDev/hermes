@@ -5,4 +5,4 @@
 hermes-ca.crt
 hermes-ca.key
 
-.hermes-sessions
+.hermes-*
