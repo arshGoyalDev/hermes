@@ -8,9 +8,14 @@ name = "hermes"
 path = "src/main.rs"
 
 [dependencies]
-proxy = { path = "../proxy" }
-store = { path = "../store" }
-tui = { path = "../tui" }
+proxy   = { path = "../proxy" }
+store   = { path = "../store" }
+tui     = { path = "../tui" }
 scripts = { path = "../scripts" }
-tokio = { version = "1", features = ["full"] }
-clap = { version = "4", features = ["derive"] }
+tokio   = { version = "1", features = ["full"] }
+clap    = { version = "4", features = ["derive"] }
+uuid    = { version = "1", features = ["v4"] }
+rustls        = "0.23"
+tokio-rustls  = "0.26"
+webpki-roots  = "0.26"
+libc          = "0.2"
