@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use scripts::{ScriptAction, ScriptEngine};
 use store::{RequestData, ResponseData, Transaction};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -51,6 +52,8 @@ struct ProxyState {
   cert_cache: Mutex<std::collections::HashMap<String, Arc<ServerConfig>>>,
   /// Sender half of the channel that feeds captured transactions to the TUI.
   tx_sink: mpsc::UnboundedSender<Transaction>,
+  /// Rhai script pipeline — consulted before forwarding each request.
+  script_engine: Arc<ScriptEngine>,
 }
 
 impl ProxyState {
@@ -58,6 +61,7 @@ impl ProxyState {
     ca_cert: rcgen::Certificate,
     ca_key: rcgen::KeyPair,
     tx_sink: mpsc::UnboundedSender<Transaction>,
+    script_engine: ScriptEngine,
   ) -> io::Result<Self> {
     let mut roots = RootCertStore::empty();
     roots.extend(TLS_SERVER_ROOTS.iter().cloned());
@@ -73,6 +77,7 @@ impl ProxyState {
       tls_connector,
       cert_cache: Mutex::new(std::collections::HashMap::new()),
       tx_sink,
+      script_engine: Arc::new(script_engine),
     })
   }
 
@@ -98,13 +103,15 @@ impl ProxyState {
 }
 
 /// Run the proxy, forwarding every captured transaction to `tx_sink`.
+/// `script_engine` is consulted before forwarding each request.
 pub async fn run(
   config: ProxyConfig,
   tx_sink: mpsc::UnboundedSender<Transaction>,
+  script_engine: ScriptEngine,
 ) -> io::Result<()> {
   let (ca_cert, ca_key) = load_or_create_ca()?;
   print_install_instructions(CA_CERT_PATH);
-  let state = Arc::new(ProxyState::new(ca_cert, ca_key, tx_sink)?);
+  let state = Arc::new(ProxyState::new(ca_cert, ca_key, tx_sink, script_engine)?);
   let listener = TcpListener::bind(config.bind_addr).await?;
   eprintln!("Hermes proxy listening on {}", config.bind_addr);
 
@@ -185,10 +192,6 @@ async fn handle_connect_mitm(
 
   let (upstream_host, upstream_port, forward_target, mut headers) = resolve_upstream(&request)?;
   remove_header(&mut headers, "proxy-connection");
-
-  // Force connection close so the upstream commits to one request per tunnel.
-  // This prevents curl from reusing the CONNECT tunnel and hitting broken-pipe
-  // errors (which cause multi-second retry delays).
   force_close(&mut headers);
   if !has_header(&headers, "host") {
     let host_value = if upstream_port == 443 {
@@ -200,6 +203,41 @@ async fn handle_connect_mitm(
   }
 
   let url = format!("https://{}{}", upstream_host, forward_target);
+
+  // ── Script pipeline ───────────────────────────────────────────────────────
+  // Run on a blocking thread so Rhai doesn't starve the async runtime.
+  let script_engine = Arc::clone(&state.script_engine);
+  let (script_method, script_url, script_headers) =
+    (request.method.clone(), url.clone(), headers.clone());
+  let action = tokio::task::spawn_blocking(move || {
+    script_engine.run(&script_method, &script_url, &script_headers)
+  })
+  .await
+  .unwrap_or(ScriptAction::Passthrough);
+
+  match action {
+    ScriptAction::Passthrough => {}
+    ScriptAction::ModifyHeaders(new_hdrs) => headers = new_hdrs,
+    ScriptAction::Drop => {
+      let resp = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+      client_reader.get_mut().write_all(resp).await?;
+      return Ok(());
+    }
+    ScriptAction::MockResponse { status, headers: resp_hdrs, body } => {
+      let reason = http_reason(status);
+      let start = format!("HTTP/1.1 {status} {reason}");
+      let mut mock_hdrs = resp_hdrs;
+      if !mock_hdrs.iter().any(|(n, _)| n.eq_ignore_ascii_case("content-length")) {
+        mock_hdrs.push(("Content-Length".into(), body.len().to_string()));
+      }
+      mock_hdrs.push(("Connection".into(), "close".into()));
+      let head = build_head(&start, &mock_hdrs);
+      client_reader.get_mut().write_all(&head).await?;
+      client_reader.get_mut().write_all(&body).await?;
+      return Ok(());
+    }
+  }
+
   let start_line = format!("{} {} {}", request.method, forward_target, request.version);
   let head_bytes = build_head(&start_line, &headers);
   upstream_tls.write_all(&head_bytes).await?;
@@ -308,6 +346,40 @@ async fn handle_http(
   }
 
   let url = format!("http://{}{}", upstream_host, forward_target);
+
+  // ── Script pipeline ───────────────────────────────────────────────────────
+  let script_engine = Arc::clone(&state.script_engine);
+  let (script_method, script_url, script_headers) =
+    (request.method.clone(), url.clone(), headers.clone());
+  let action = tokio::task::spawn_blocking(move || {
+    script_engine.run(&script_method, &script_url, &script_headers)
+  })
+  .await
+  .unwrap_or(ScriptAction::Passthrough);
+
+  match action {
+    ScriptAction::Passthrough => {}
+    ScriptAction::ModifyHeaders(new_hdrs) => headers = new_hdrs,
+    ScriptAction::Drop => {
+      let resp = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+      reader.get_mut().write_all(resp).await?;
+      return Ok(());
+    }
+    ScriptAction::MockResponse { status, headers: resp_hdrs, body } => {
+      let reason = http_reason(status);
+      let start = format!("HTTP/1.1 {status} {reason}");
+      let mut mock_hdrs = resp_hdrs;
+      if !mock_hdrs.iter().any(|(n, _)| n.eq_ignore_ascii_case("content-length")) {
+        mock_hdrs.push(("Content-Length".into(), body.len().to_string()));
+      }
+      mock_hdrs.push(("Connection".into(), "close".into()));
+      let head = build_head(&start, &mock_hdrs);
+      reader.get_mut().write_all(&head).await?;
+      reader.get_mut().write_all(&body).await?;
+      return Ok(());
+    }
+  }
+
   let start_line = format!("{} {} {}", request.method, forward_target, request.version);
   let head_bytes = build_head(&start_line, &headers);
 
@@ -405,6 +477,30 @@ async fn handle_http(
     }
   }
   Ok(())
+}
+
+/// Map a status code to its standard reason phrase.
+fn http_reason(status: u16) -> &'static str {
+  match status {
+    200 => "OK",
+    201 => "Created",
+    204 => "No Content",
+    301 => "Moved Permanently",
+    302 => "Found",
+    304 => "Not Modified",
+    400 => "Bad Request",
+    401 => "Unauthorized",
+    403 => "Forbidden",
+    404 => "Not Found",
+    405 => "Method Not Allowed",
+    418 => "I'm a Teapot",
+    429 => "Too Many Requests",
+    500 => "Internal Server Error",
+    502 => "Bad Gateway",
+    503 => "Service Unavailable",
+    504 => "Gateway Timeout",
+    _ => "Unknown",
+  }
 }
 
 fn resolve_upstream(
